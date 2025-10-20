@@ -2,6 +2,9 @@
 
 Plan classifier coverage for a global calendar of events while keeping costs in check across three rounds (years) and multiple disruption scenarios. The app supports many simultaneous teams via Streamlit session state and caching.
 
+developments idea: Tiago Russomanno
+code: AI+ Author 
+
 ---
 
 ## ✨ Key Features
