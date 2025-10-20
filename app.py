@@ -351,14 +351,34 @@ def show_results_tables_and_charts(df1=None, t1=None, mix1=None, df2=None, t2=No
         st.pyplot(fig)
 
     # Cost mix pies
+    #def pie(mix, title):
+       # fig = plt.figure()
+      #  plt.pie([mix["travel"], mix["training"], mix["remote"]], labels=["Travel","Training","Remote"], autopct="%1.0f%%", startangle=90)
+     #   plt.title(title); plt.axis("equal")
+    #    st.pyplot(fig)
+   # if mix1: pie(mix1, "Cost Mix – Year 1")
+  #  if mix2: pie(mix2, "Cost Mix – Year 2")
+ #   if mix3: pie(mix3, "Cost Mix – Year 3")
+
     def pie(mix, title):
+        # Robustly pull numbers (handles missing keys/None)
+        vals = [
+            float(mix.get("travel", 0) or 0),
+            float(mix.get("training", 0) or 0),
+            float(mix.get("remote", 0) or 0),
+                ]
+        total = sum(vals)
+
+        if total <= 0:
+            st.info(f"{title}: no costs to plot yet.")
+            return
+
         fig = plt.figure()
-        plt.pie([mix["travel"], mix["training"], mix["remote"]], labels=["Travel","Training","Remote"], autopct="%1.0f%%", startangle=90)
-        plt.title(title); plt.axis("equal")
+        plt.pie(vals, labels=["Travel", "Training", "Remote"], autopct="%1.0f%%", startangle=90)
+        plt.title(title)
+        plt.axis("equal")
         st.pyplot(fig)
-    if mix1: pie(mix1, "Cost Mix – Year 1")
-    if mix2: pie(mix2, "Cost Mix – Year 2")
-    if mix3: pie(mix3, "Cost Mix – Year 3")
+
 
 # -----------------------------
 # Round 1
