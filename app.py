@@ -1,9 +1,10 @@
 # The Global Classifier Challenge — Streamlit App (v1, multi-user friendly)
 # Updated: prefill fix, robust charts, team name in outputs, combined downloads, forms, perf tweaks
+# NEW: training in earlier rounds unlocks L1/L2 capabilities in later rounds
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 
 import pandas as pd
 import streamlit as st
@@ -97,6 +98,7 @@ def dist_km(base_city: str, event_city: str) -> int:
 
 # Fast lookups
 CLF_BY_ID = {c["id"]: c for c in CLASSIFIERS}
+BASE_LEVELS: Dict[str, Set[str]] = {c["id"]: {c["level"]} for c in CLASSIFIERS}
 
 @st.cache_data
 def precompute_costs():
@@ -114,6 +116,64 @@ def precompute_costs():
 BASE_COSTS = precompute_costs()
 
 # -----------------------------
+# Training upgrades across rounds
+# -----------------------------
+# We store cumulative upgrades after each completed round:
+#   st.session_state.upgrades_after_R1: Dict[cid, Set["L1"|"L2"]]
+#   st.session_state.upgrades_after_R2: Dict[cid, Set["L1"|"L2"]]
+st.session_state.setdefault("upgrades_after_R1", {})
+st.session_state.setdefault("upgrades_after_R2", {})
+
+def compute_upgrades_from_assignments(assignments: Dict[str, dict]) -> Dict[str, Set[str]]:
+    """
+    Any classifier assigned to an event with 'Train L1' gains L1,
+    with 'Train L2' gains L2 — for FUTURE rounds.
+    """
+    gains: Dict[str, Set[str]] = {}
+    for ev_name, plan in assignments.items():
+        training = plan.get("training", [])
+        cids = plan.get("classifiers", [])
+        add_l1 = "Train L1" in training
+        add_l2 = "Train L2" in training
+        if not (add_l1 or add_l2) or not cids:
+            continue
+        for cid in cids:
+            if cid not in gains:
+                gains[cid] = set()
+            if add_l1:
+                gains[cid].add("L1")
+            if add_l2:
+                gains[cid].add("L2")
+    return gains
+
+def get_effective_levels_for_round(round_key: str) -> Dict[str, Set[str]]:
+    """
+    Effective levels = base levels + upgrades from prior rounds only.
+    - R1: base only
+    - R2: base + upgrades_after_R1
+    - R3: base + upgrades_after_R1 + upgrades_after_R2
+    """
+    eff = {cid: set(levels) for cid, levels in BASE_LEVELS.items()}
+    if round_key in ("R2", "R3"):
+        for cid, adds in st.session_state.get("upgrades_after_R1", {}).items():
+            eff.setdefault(cid, set()).update(adds)
+    if round_key == "R3":
+        for cid, adds in st.session_state.get("upgrades_after_R2", {}).items():
+            eff.setdefault(cid, set()).update(adds)
+    return eff
+
+def label_for_classifier(cid: str, eff_levels: Dict[str, Set[str]]) -> str:
+    """Show base level and arrows for upgrades, e.g., 'C-2 • Warsaw • L1 (↑L2)'."""
+    base_level = next(iter(BASE_LEVELS[cid]))
+    eff = eff_levels.get(cid, {base_level})
+    gained = sorted(list(eff - {base_level}))
+    clf = CLF_BY_ID[cid]
+    if gained:
+        return f"{cid} • {clf['base']} • {base_level} (↑{','.join(gained)}) • €{clf['cost_per_km']}/km"
+    else:
+        return f"{cid} • {clf['base']} • {base_level} • €{clf['cost_per_km']}/km"
+
+# -----------------------------
 # Core compute
 # -----------------------------
 @dataclass
@@ -125,11 +185,10 @@ class Scenario:
     free_train_L1: int = 0
     new_event: bool = False
 
-def summarize_round(events: List[dict], assignments: Dict[str, dict], scen: Scenario) -> Tuple[pd.DataFrame, float, bool, Dict[str, float]]:
+def summarize_round(events: List[dict], assignments: Dict[str, dict], scen: Scenario,
+                    eff_levels: Dict[str, Set[str]]) -> Tuple[pd.DataFrame, float, bool, Dict[str, float]]:
     rows=[]; total=0.0; coverage_ok=True
     sums = {"travel":0.0,"training":0.0,"remote":0.0}
-
-    # work on a local copy of scen so we can decrement free_remote_events safely
     scen_local = Scenario(**scen.__dict__)
 
     for ev in events:
@@ -138,7 +197,7 @@ def summarize_round(events: List[dict], assignments: Dict[str, dict], scen: Scen
         plan = assignments.get(ev_name, {"classifiers":[], "training":[], "remote":False})
         cids = plan.get("classifiers", []); training = plan.get("training", []); remote = plan.get("remote", False)
 
-        # apply free remote (scenario) lazily at first eligible event
+        # Free remote applied lazily once
         if scen_local.free_remote_events > 0 and not remote:
             remote = True
             scen_local.free_remote_events -= 1
@@ -148,12 +207,15 @@ def summarize_round(events: List[dict], assignments: Dict[str, dict], scen: Scen
             if cid in scen_local.visa_blocked:
                 continue
             clf = CLF_BY_ID.get(cid)
-            if not clf: 
+            if not clf:
                 continue
-            if clf["level"]=="L1": haveL1+=1
-            if clf["level"]=="L2": haveL2+=1
+
+            # coverage using effective levels
+            levels = eff_levels.get(cid, {clf["level"]})
+            if "L1" in levels: haveL1 += 1
+            if "L2" in levels: haveL2 += 1
+
             base_cost = BASE_COSTS.get((cid, city), 0.0) * scen_local.travel_mult
-            # carbon penalty checks actual distance
             if scen_local.carbon:
                 d = dist_km(clf["base"], city)
                 if d >= CARBON_THRESHOLD_KM:
@@ -173,7 +235,7 @@ def summarize_round(events: List[dict], assignments: Dict[str, dict], scen: Scen
 
         rows.append([ev_name, covered, haveL1, haveL2, round(travel_total,2), training_total, remote_total, round(event_total,2)])
 
-    # apply free L1 training subsidy across the round
+    # Scenario free L1 trainings (budget) applied cross-event
     if scen_local.free_train_L1:
         l1_trains = sum(1 for p in assignments.values() for t in p.get("training",[]) if t=="Train L1")
         deduct = min(l1_trains, scen_local.free_train_L1) * TRAIN_L1_COST
@@ -181,7 +243,6 @@ def summarize_round(events: List[dict], assignments: Dict[str, dict], scen: Scen
         sums["training"] = max(0.0, sums["training"] - deduct)
 
     df = pd.DataFrame(rows, columns=["Event","Covered","Have L1","Have L2","Travel €","Training €","Remote €","Event Total €"])
-    # add team name as first column
     df.insert(0, "Team", st.session_state.get("team_name", "Unknown"))
     return df, round(total,2), coverage_ok, {k: round(v,2) for k,v in sums.items()}
 
@@ -256,19 +317,20 @@ elif tabs == "Data":
         st_folium(m, width=1000, height=520)
 
 # -----------------------------
-# UI builders for rounds (BIG checkbox panels)
+# UI builders for rounds
 # -----------------------------
 def round_planner_ui(round_key: str):
-    """Return assignments dict based on user selections for the given round."""
+    """Return assignments dict for the given round, using effective levels (with upgrades)."""
     ver = st.session_state.get(f"keyver_{round_key}", 0)
+    eff_levels = get_effective_levels_for_round(round_key)
     st.caption(f"Select classifiers, training, and remote for **{round_key}**")
 
-    # load any existing plan to prefill defaults
     prefill = st.session_state.get(f"assign_{round_key}", {})
-
     assignments = {}
-    L1 = [c for c in CLASSIFIERS if c["level"]=="L1"]
-    L2 = [c for c in CLASSIFIERS if c["level"]=="L2"]
+
+    # Build lists from effective levels
+    L1_ids = [cid for cid, levels in eff_levels.items() if "L1" in levels]
+    L2_ids = [cid for cid, levels in eff_levels.items() if "L2" in levels]
 
     for ev in st.session_state.events:
         ev_name = ev["event"]
@@ -277,19 +339,19 @@ def round_planner_ui(round_key: str):
             with col1:
                 st.markdown("**Select L1**")
                 l1_selected = []
-                for c in L1:
-                    key = f"{round_key}_v{ver}_{ev_name}_L1_{c['id']}"
-                    default = c["id"] in prefill.get(ev_name, {}).get("classifiers", [])
-                    on = st.checkbox(f"{c['id']} • {c['base']} • €{c['cost_per_km']}/km", value=default, key=key)
-                    if on: l1_selected.append(c["id"])
+                for cid in L1_ids:
+                    key = f"{round_key}_v{ver}_{ev_name}_L1_{cid}"
+                    default = cid in prefill.get(ev_name, {}).get("classifiers", [])
+                    on = st.checkbox(label_for_classifier(cid, eff_levels), value=default, key=key)
+                    if on: l1_selected.append(cid)
             with col2:
                 st.markdown("**Select L2**")
                 l2_selected = []
-                for c in L2:
-                    key = f"{round_key}_v{ver}_{ev_name}_L2_{c['id']}"
-                    default = c["id"] in prefill.get(ev_name, {}).get("classifiers", [])
-                    on = st.checkbox(f"{c['id']} • {c['base']} • €{c['cost_per_km']}/km", value=default, key=key)
-                    if on: l2_selected.append(c["id"])
+                for cid in L2_ids:
+                    key = f"{round_key}_v{ver}_{ev_name}_L2_{cid}"
+                    default = cid in prefill.get(ev_name, {}).get("classifiers", [])
+                    on = st.checkbox(label_for_classifier(cid, eff_levels), value=default, key=key)
+                    if on: l2_selected.append(cid)
 
             st.markdown("---")
             c1, c2, c3, c4 = st.columns(4)
@@ -323,7 +385,7 @@ def round_planner_ui(round_key: str):
 
     # Save for later use
     st.session_state[f"assign_{round_key}"] = assignments
-    return assignments
+    return assignments, eff_levels
 
 def scenarios_ui(label: str) -> Scenario:
     opts = [
@@ -412,11 +474,15 @@ if tabs == "Round 1":
     st.header("Round 1 — Planning Year")
 
     with st.form("r1_form"):
-        assignments = round_planner_ui("R1")
+        assignments, eff_levels = round_planner_ui("R1")
         submitted = st.form_submit_button("Calculate Round 1")
     if submitted:
-        df1, t1, ok1, mix1 = summarize_round(st.session_state.events, assignments, Scenario())
+        df1, t1, ok1, mix1 = summarize_round(st.session_state.events, assignments, Scenario(), eff_levels)
         st.session_state.df1, st.session_state.t1, st.session_state.ok1, st.session_state.mix1 = df1, t1, ok1, mix1
+
+        # compute & store upgrades for use in R2
+        st.session_state.upgrades_after_R1 = compute_upgrades_from_assignments(assignments)
+
         st.dataframe(df1, use_container_width=True)
         st.success(f"TOTAL (Year 1): €{t1:,.0f} | Coverage OK: {ok1}")
         st.download_button(
@@ -455,11 +521,15 @@ elif tabs == "Round 2":
     st.caption(f"Active Round 2 scenarios: {scen2.__dict__}")
 
     with st.form("r2_form"):
-        assignments = round_planner_ui("R2")
+        assignments, eff_levels = round_planner_ui("R2")
         submitted = st.form_submit_button("Calculate Round 2")
     if submitted:
-        df2, t2, ok2, mix2 = summarize_round(st.session_state.events, assignments, scen2)
+        df2, t2, ok2, mix2 = summarize_round(st.session_state.events, assignments, scen2, eff_levels)
         st.session_state.df2, st.session_state.t2, st.session_state.ok2, st.session_state.mix2 = df2, t2, ok2, mix2
+
+        # compute & store upgrades for use in R3
+        st.session_state.upgrades_after_R2 = compute_upgrades_from_assignments(assignments)
+
         st.dataframe(df2, use_container_width=True)
         st.success(f"TOTAL (Year 2): €{t2:,.0f} | Coverage OK: {ok2}")
         st.download_button(
@@ -484,11 +554,12 @@ elif tabs == "Round 3":
     st.caption(f"Active Round 3 scenarios: {scen3.__dict__}")
 
     with st.form("r3_form"):
-        assignments = round_planner_ui("R3")
+        assignments, eff_levels = round_planner_ui("R3")
         submitted = st.form_submit_button("Calculate Round 3")
     if submitted:
-        df3, t3, ok3, mix3 = summarize_round(st.session_state.events, assignments, scen3)
+        df3, t3, ok3, mix3 = summarize_round(st.session_state.events, assignments, scen3, eff_levels)
         st.session_state.df3, st.session_state.t3, st.session_state.ok3, st.session_state.mix3 = df3, t3, ok3, mix3
+
         st.dataframe(df3, use_container_width=True)
         st.success(f"TOTAL (Year 3): €{t3:,.0f} | Coverage OK: {ok3}")
         st.download_button(
